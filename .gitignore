@@ -1,0 +1,14 @@
+build/
+*.o
+*.a
+*.so
+data/
+Logger_txt/
+WAL_txt
+*.sst
+*.idx
+*.log
+.vscode/
+.idea/
+*.swp
+.DS_Store
