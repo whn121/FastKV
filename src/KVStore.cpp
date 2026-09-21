@@ -3,88 +3,31 @@
 
 
 
-KVStore::KVStore() : wal_("../Logger_txt/WAL_txt") 
+KVStore::KVStore() : wal_("../Logger_txt/WAL_txt")
 {
+    // 1. 确保目录存在
     std::filesystem::create_directories("../data/level_0");
     std::filesystem::create_directories("../data/level_1");
 
-    uint64_t level_0_max_id = 0;
-    uint64_t level_1_max_id = 0;
+    // 2. 清理残留的 .tmp 文件
+    CleanupTmpFiles("../data/level_0");
+    CleanupTmpFiles("../data/level_1");
 
-    bool level_0_has_sstable = false; //解决文件为空,从"1"开始的问题
-    bool level_1_has_sstable = false; //解决文件为空,从"1"开始的问题
+    // 3. 加载 level_0
+    auto lv0_max = LoadAllSSTables("../data/level_0", 0);
+    level_0_next_id_ = lv0_max.has_value() ? (lv0_max.value() + 1) : 0;
 
-    for (const auto& entry : std::filesystem::directory_iterator("../data/level_0"))
-    {
-        std::string filename = entry.path().filename().string();
-        
-        if (filename.rfind("SSTable_", 0) != 0)
-            continue;
+    // 4. 加载 level_1
+    auto lv1_max = LoadAllSSTables("../data/level_1", 1);
+    level_1_next_id_ = lv1_max.has_value() ? (lv1_max.value() + 1) : 0;
 
-        if (filename.size() <= 12)
-            continue;
-
-        std::string id_str = filename.substr(8);
-        id_str = id_str.substr(0, id_str.size() - 4);
-
-        uint64_t id = std::stoull(id_str);
-
-        if(!level_0_has_sstable || id > level_0_max_id)
-        {
-            level_0_max_id = id;
-            level_0_has_sstable = true;
-        }
-    }
-
-    if (level_0_has_sstable) 
-    {
-        std::string path = "../data/level_0";
-        LoadIndex(level_0_max_id, path, 0); //放到内存里
-        level_0_next_id_ = level_0_max_id + 1;
-    }
-    else level_0_next_id_ = 0;
-
-    for (const auto& entry : std::filesystem::directory_iterator("../data/level_1"))
-    {
-        std::string filename = entry.path().filename().string();
-        
-        if (filename.rfind("SSTable_", 0) != 0)
-            continue;
-
-        if (filename.size() <= 12)
-            continue;
-
-        std::string id_str = filename.substr(8);
-        id_str = id_str.substr(0, id_str.size() - 4);
-
-        uint64_t id = std::stoull(id_str);
-
-        if(!level_1_has_sstable || id > level_1_max_id)
-        {
-            level_1_max_id = id;
-            level_1_has_sstable = true;
-        }
-    }
-
-    if (level_1_has_sstable) 
-    {
-        std::string path = "../data/level_1";
-        LoadIndex(level_1_max_id, path, 1); //放到内存里
-        level_1_next_id_ = level_1_max_id + 1;
-    }
-    else level_1_next_id_ = 0;
-
-    // 恢复 WAL
-    wal_.Replay
-    (
-        [this](Type& type, std::string& key, std::string& value)
-        {
+    // 5. 恢复 WAL（把未落盘的写入重放到 MemTable）
+    wal_.Replay(
+        [this](Type& type, std::string& key, std::string& value) {
             wal_use_memtable_callback(type, key, value);
         }
     );
-
 }
-
 
 bool KVStore::Put(const std::string& key, const std::string& value)
 {
@@ -171,39 +114,72 @@ void KVStore::Flush()
         if (sstable_.Compact(level_0_next_id_, level_1_next_id_))
         {
             // 删掉 level_0 里的旧文件，但保留目录
-            for (uint64_t id = 0; id < level_0_next_id_; ++id)
+            for (uint64_t id = 0; id < level_0_next_id_; ++id) 
             {
-                std::filesystem::remove("../data/level_0/SSTable_" + std::to_string(id) + ".sst");
-                std::filesystem::remove("../data/level_0/index_" + std::to_string(id) + ".idx");
-                sstable_.RemoveIndex(id, 0);  
+                std::string path = "../data/level_0/SSTable_" + std::to_string(id) + ".sst";
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+
+                sstable_.RemoveIndex(id, 0);
             }
             level_0_next_id_ = 0;   // 重置计数器
         }
     }
 
 }
-void KVStore::LoadIndex(uint64_t max_id, std::string& level_dir, int level)
+
+std::optional<uint64_t> KVStore::LoadAllSSTables(const std::string& dir, int level)
 {
-    for (uint64_t id = 0; id <= max_id; ++id)
+    std::optional<uint64_t> max_id;
+
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
     {
-        std::ifstream read (level_dir + "/index_" + std::to_string(id) + ".idx"
-                            , std::ios::binary);
-        
-        if (!read) continue;
+        auto id = ParseSSTableId(entry.path().filename().string());
+        if (!id.has_value()) continue;
 
-        while(1)
-        {
-            uint32_t key_len;
-            if (!read.read(reinterpret_cast<char*> (&key_len), sizeof(key_len))) break;
-            
-            std::string key;
-            key.resize(key_len);
-            if (!read.read(reinterpret_cast<char*> (key.data()), key_len)) break;
-            
-            uint64_t offset;
-            if (!read.read(reinterpret_cast<char*> (&offset), sizeof(offset))) break;
-
-            sstable_.SubIndex(id, key, offset, level);
+        // 加载这个 SSTable（读 Footer + Index + Bloom 到内存）
+        if (!sstable_.LoadFile(id.value(), level, entry.path().string())) {
+            std::cerr << "Failed to load " << entry.path().string() << std::endl;
+            continue;
         }
+
+        // 更新 max_id
+        if (!max_id.has_value() || id.value() > max_id.value()) {
+            max_id = id.value();
+        }
+    }
+
+    return max_id;
+}
+
+void KVStore::CleanupTmpFiles(const std::string& dir)
+{
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".tmp") {
+            std::error_code ec;
+            std::filesystem::remove(entry.path(), ec);
+        }
+    }
+}
+
+std::optional<uint64_t> KVStore::ParseSSTableId(const std::string& filename)
+{
+    // 格式：SSTable_<id>.sst
+    // 最小长度：SSTable_0.sst = 13 字符
+    if (filename.size() < 13) return std::nullopt;
+    if (filename.substr(0, 8) != "SSTable_") return std::nullopt;
+    if (filename.substr(filename.size() - 4) != ".sst") return std::nullopt;
+
+    // 提取 id 部分
+    // filename = "SSTable_0.sst"
+    // substr(8, size-12) = substr(8, 1) = "0"
+    std::string id_str = filename.substr(8, filename.size() - 12);
+    if (id_str.empty()) return std::nullopt;
+
+    try {
+        return std::stoull(id_str);
+    } catch (...) {
+        return std::nullopt;
     }
 }

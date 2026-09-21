@@ -1,270 +1,386 @@
 #include "SSTable.h"
 #include <filesystem>
-
+#include <iostream>
 
 
 //标记 1 + kl 4 + k + vl 4 +vl
 
 bool SSTable::Write(const MemTable &memtable, uint64_t* next_id)
 {
-    std::string path_s = "../data/level_0/SSTable_" + std::to_string(*next_id) + ".sst";
-    std::string path_i = "../data/level_0/index_" + std::to_string(*next_id) + ".idx";
+    std::string path = "../data/level_0/SSTable_" + std::to_string(*next_id) + ".sst";
+    std::string tmp_path = path + ".tmp";
 
-    if (std::filesystem::exists(path_s)) return false; // ID 冲突，不要覆盖
-    if (std::filesystem::exists(path_i)) return false; // ID 冲突，不要覆盖
+    // 用 trunc 创建临时文件
+    std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
 
-    std::ofstream write_s (path_s, std::ios::trunc | std::ios::binary);//存在清空不存在创建 | 二进制打开
-    if (!write_s) return false;
-    std::ofstream write_i (path_i, std::ios::trunc | std::ios::binary);//存在清空不存在创建 | 二进制打开
-    if (!write_i) return false;
+    Footer footer{};
 
-    const auto& map = memtable.Data(); //只拿引用不复制整个map
-    for (const auto& it : map)//只拿引用不复制整个map
+    // 1.Data Section
+    footer.data_offset = f.tellp();
+
+    BloomFilter bloom(memtable.Data().size());
+
+    for (const auto& it : memtable.Data())
     {
-        uint8_t entry = it.second.deleted;
-        uint32_t key_len = it.first.size();
-        uint32_t value_len = it.second.value.size();
-        
-        uint64_t offset = write_s.tellp(); //获得当前位置
+        uint8_t deleted = it.second.deleted;
+        uint32_t key_len = static_cast<uint32_t> (it.first.size());
+        uint32_t value_len = static_cast<uint32_t> (it.second.value.size());
 
-        level0_index_[*next_id][it.first] = offset; //
+        // 相对 data section 的偏移
+        uint64_t offset_in_data = static_cast<uint64_t> (f.tellp()) - footer.data_offset;
 
-        if (!write_s.write(reinterpret_cast<const char*> (&entry), sizeof(entry))) return false;
-        if (!write_s.write(reinterpret_cast<const char*> (&key_len), sizeof(key_len))) return false;
-        if (!write_s.write(reinterpret_cast<const char*> (it.first.data()), key_len)) return false;
-        if (!write_s.write(reinterpret_cast<const char*> (&value_len), sizeof(value_len))) return false;
-        if (!write_s.write(reinterpret_cast<const char*> (it.second.value.data()), value_len)) return false;
-    
-        if (!write_i.write(reinterpret_cast<const char*> (&key_len), sizeof(key_len))) return false;
-        if (!write_i.write(reinterpret_cast<const char*> (it.first.data()), key_len)) return false;
-        if (!write_i.write(reinterpret_cast<const char*> (&offset), sizeof(offset))) return false;
+        level0_index_[*next_id][it.first] = offset_in_data;
+        bloom.Add(it.first);
+
+        f.write(reinterpret_cast<const char*>(&deleted), sizeof(deleted));
+        f.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
+        f.write(it.first.data(), key_len);
+        f.write(reinterpret_cast<const char*>(&value_len), sizeof(value_len));
+        f.write(it.second.value.data(), value_len);
+
+        if (!f) return false;
 
     }
-    
-    write_s.close();
-    write_i.close();
-    return write_s.good() && write_i.good();//检查write的状态
+
+    footer.data_size = static_cast<uint64_t>(f.tellp()) - footer.data_offset;
+
+    //2.Index Section
+    footer.index_offset = f.tellp();
+
+    for (const auto& [key, offset] : level0_index_[*next_id])
+    {
+        uint32_t key_len = static_cast<uint32_t>(key.size());
+        f.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
+        f.write(key.data(), key_len);
+        f.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
+    }
+
+    footer.index_size = static_cast<uint64_t>(f.tellp()) - footer.index_offset;
+
+    //3.Bloom Section
+    footer.bloom_offset = f.tellp();
+
+    level0_bloom_[*next_id] = std::move(bloom);
+    std::string bloom_data = level0_bloom_[*next_id].Serialize();
+    f.write(bloom_data.data(), bloom_data.size());
+
+    footer.bloom_size = static_cast<uint64_t>(f.tellp()) - footer.bloom_offset;
+
+    //4.Footer
+    footer.magic = FOOTER_MAGIC;
+    f.write(reinterpret_cast<const char*>(&footer), sizeof(footer));
+
+    f.close();
+
+    //5. 原子 rename 全部写完变更名字,防止写一半中断存在不完整的.sst文件,现在要么没有要么完整
+    try 
+    {
+        std::filesystem::rename(tmp_path, path);
+    } 
+    catch (const std::exception& e) 
+    {
+        std::cerr << "rename failed: " << e.what() << std::endl;
+        return false;
+    }
+
+    return true;
 }
+
 
 bool SSTable::Get(const std::string& key, std::string& value, uint64_t lv0_startid, uint64_t lv1_startid)
 {
-    uint64_t lv0_id = lv0_startid;
-    while (1)
+    //level_0
+    if (lv0_startid != UINT64_MAX)
     {
-        std::ifstream read ("../data/level_0/SSTable_" + std::to_string(lv0_id) + ".sst"
-                            , std::ios::binary);
-        if (!read) //跳过缺失文件
+        for (uint64_t id = lv0_startid + 1; id-- > 0; )
         {
-            if (lv0_id == 0) break;
-            --lv0_id;
-            continue;
+            // 1. Bloom 过滤
+            if (!BloomMayContain(id, 0, key)) {
+                if (id == 0) break;
+                continue;
+            }
+
+            //2. 查内存 Index
+            auto idx_it = level0_index_.find(id);
+            if (idx_it == level0_index_.end())
+            {
+                if (id == 0) break;
+                continue;
+            }
+            auto it = idx_it->second.find(key);
+            if (it == idx_it->second.end())
+            {
+                if (id == 0) break;
+                continue;
+            }
+
+            //3. 从磁盘读 data
+            std::string path = "../data/level_0/SSTable_" + std::to_string(id) + ".sst";
+            std::ifstream f(path, std::ios::binary);
+            if (!f)
+            {
+                if (id == 0) break;
+                continue;
+            }
+
+            uint64_t data_offset = level0_data_offset_[id];
+            f.seekg(data_offset + it->second);
+
+            if (ReadEntry(f, value)) return true;
+            return false;   // tombstone 或读失败
+
+            if (id == 0) break;
+
         }
-
-        auto file_index = level0_index_.find(lv0_id);
-
-        if (file_index == level0_index_.end()) //跳过
-        {
-            if (lv0_id == 0) break;
-            --lv0_id;
-            continue;
-        }
-
-        auto it = file_index->second.find(key);
-
-        if (it == file_index->second.end())
-        {
-            if (lv0_id == 0) break;
-            --lv0_id;
-            continue;
-        }
-
-        read.seekg(it->second);
-
-        uint8_t deleted;
-        if (!read.read(reinterpret_cast<char*> (&deleted), sizeof(deleted))) return false;
-        
-        uint32_t key_len;
-        if (!read.read(reinterpret_cast<char*> (&key_len), sizeof(key_len))) return false;
-        std::string key1;
-        key1.resize(key_len);
-        if (!read.read(reinterpret_cast<char*> (key1.data()), key_len)) return false;
-
-        uint32_t value_len;
-        if (!read.read(reinterpret_cast<char*> (&value_len),sizeof(value_len))) return false;
-        std::string value1;
-        value1.resize(value_len);
-        if (!read.read(reinterpret_cast<char*> (value1.data()), value_len)) return false;
-
-        if (deleted) return false; //最新是 tombstone.不能继续查旧表
-
-        if (!deleted) 
-        {
-            value = std::move (value1);
-
-            read.close();
-
-            return true;
-        }
-
-        if (lv0_id == 0) break;
-
-        --lv0_id;
     }
 
-    uint64_t lv1_id = lv1_startid;
-    while (1)
+    //level_1
+    if (lv1_startid != UINT64_MAX)
     {
-        std::ifstream read ("../data/level_1/SSTable_" + std::to_string(lv1_id) + ".sst"
-                            , std::ios::binary);
-        if (!read) //跳过缺失文件
+        for (uint64_t id = lv1_startid + 1; id-- > 0; )
         {
-            if (lv1_id == 0) break;
-            --lv1_id;
-            continue;
+            if (!BloomMayContain(id, 1, key)) {
+                if (id == 0) break;
+                continue;
+            }
+
+            auto idx_it = level1_index_.find(id);
+            if (idx_it == level1_index_.end()) {
+                if (id == 0) break;
+                continue;
+            }
+            auto it = idx_it->second.find(key);
+            if (it == idx_it->second.end()) {
+                if (id == 0) break;
+                continue;
+            }
+
+            std::string path = "../data/level_1/SSTable_" + std::to_string(id) + ".sst";
+            std::ifstream f(path, std::ios::binary);
+            if (!f) {
+                if (id == 0) break;
+                continue;
+            }
+
+            uint64_t data_offset = level1_data_offset_[id];
+            f.seekg(data_offset + it->second);
+
+            if (ReadEntry(f, value)) return true;
+            return false;
+
+            if (id == 0) break;
         }
-
-        auto file_index = level1_index_.find(lv1_id);
-
-        if (file_index == level1_index_.end()) //跳过
-        {
-            if (lv1_id == 0) break;
-            --lv1_id;
-            continue;
-        }
-
-        auto it = file_index->second.find(key);
-
-        if (it == file_index->second.end())
-        {
-            if (lv1_id == 0) break;
-            --lv1_id;
-            continue;
-        }
-
-        read.seekg(it->second);
-
-        uint8_t deleted;
-        if (!read.read(reinterpret_cast<char*> (&deleted), sizeof(deleted))) return false;
-        
-        uint32_t key_len;
-        if (!read.read(reinterpret_cast<char*> (&key_len), sizeof(key_len))) return false;
-        std::string key1;
-        key1.resize(key_len);
-        if (!read.read(reinterpret_cast<char*> (key1.data()), key_len)) return false;
-
-        uint32_t value_len;
-        if (!read.read(reinterpret_cast<char*> (&value_len),sizeof(value_len))) return false;
-        std::string value1;
-        value1.resize(value_len);
-        if (!read.read(reinterpret_cast<char*> (value1.data()), value_len)) return false;
-
-        if (deleted) return false; //最新是 tombstone.不能继续查旧表
-
-        if (!deleted) 
-        {
-            value = std::move (value1);
-
-            read.close();
-
-            return true;
-        }
-
-        if (lv1_id == 0) break;
-
-        --lv1_id;
     }
-
 
     return false;
+
 }
 
-bool SSTable::SubIndex(uint64_t id, std::string &key, uint64_t offset, int level)
+bool SSTable::LoadFile(uint64_t id, int level, const std::string& path)
 {
-    if (level == 0)
+    std::ifstream f(path, std::ios::binary | std::ios::ate);//ate从尾端打开
+    if (!f) return false;
+
+    //1.读Footer
+    std::streamsize file_size = f.tellg();
+    if (file_size < static_cast<std::streamsize>(FOOTER_SIZE)) return false;
+
+    f.seekg(-static_cast<std::streamoff>(FOOTER_SIZE), std::ios::end); //向左移动第一个参数,基于第二个参数
+
+    Footer footer;
+    f.read(reinterpret_cast<char*> (&footer), sizeof(footer));
+    if (!f) return false;
+
+    //2.验证magic
+    if (footer.magic != FOOTER_MAGIC)
     {
-        level0_index_[id][key] = offset;
+        std::cerr << "SSTable magic mismatch: " << path << std::endl;
+        return false;
     }
+
+    //3.验证offset合法性
+    if (footer.data_offset + footer.data_size != footer.index_offset) return false;
+    if (footer.index_offset + footer.index_size != footer.bloom_offset) return false;
+    if (footer.bloom_offset + footer.bloom_size + FOOTER_SIZE != static_cast<uint64_t>(file_size)) return false;
+
+    //4.保存data_offset到内存
+    if(level == 0) level0_data_offset_[id] = footer.data_offset;
+    else level1_data_offset_[id] = footer.data_offset;
+
+    //5.读Index Section
+    f.seekg(footer.index_offset);
+
+    uint64_t index_end = footer.index_offset + footer.index_size;
+    auto& index_map = (level == 0) ? level0_index_[id] : level1_index_[id];
+
+    while (static_cast<uint64_t>(f.tellg()) < index_end)
+    {
+        uint32_t key_len;
+        if (!f.read(reinterpret_cast<char*>(&key_len), sizeof(key_len))) break;
+
+        std::string key;
+        key.resize(key_len);
+        if (!f.read(key.data(), key_len)) break;
+
+        uint64_t offset;
+        if (!f.read(reinterpret_cast<char*>(&offset), sizeof(offset))) break;
+
+        index_map[key] = offset;
+    }
+
+    //6.读Bloom Section
+    f.seekg(footer.bloom_offset);
+
+    std::string bloom_data;
+    bloom_data.resize(footer.bloom_size);
+    if (!f.read(&bloom_data[0], footer.bloom_size)) return false;
+
+    BloomFilter bf;
+    if (bf.Deserialize(bloom_data)) 
+    {
+        if (level == 0) level0_bloom_[id] = std::move(bf);
+        else            level1_bloom_[id] = std::move(bf);
+    }
+
+    return true;
+}
+
+bool SSTable::BloomMayContain(uint64_t id, int level, const std::string &key) const
+{
+    if (level == 0) 
+    {
+        auto it = level0_bloom_.find(id);
+        if (it == level0_bloom_.end()) 
+        {
+            // 没找到 bloom，保守返回 true（不确定就查 index）
+            return true;
+        }
+        return it->second.MayContain(key);
+    } 
     else 
     {
-        level1_index_[id][key] = offset;
+        auto it = level1_bloom_.find(id);
+        if (it == level1_bloom_.end()) 
+        {
+            return true;
+        }
+        return it->second.MayContain(key);
     }
-    return true;
+    return false;
 }
 
 bool SSTable::Compact(uint64_t& level_0_next_id, uint64_t& level_1_next_id)
 {
-    // 没有可合并的文件
     if (level_0_next_id == 0) return false;
 
-    std::string lv1_path_s = "../data/level_1/SSTable_" + std::to_string(level_1_next_id) + ".sst";
-    std::string lv1_path_i = "../data/level_1/index_" + std::to_string(level_1_next_id) + ".idx";
+    std::string path = "../data/level_1/SSTable_" + std::to_string(level_1_next_id) + ".sst";
+    std::string tmp_path = path + ".tmp";
 
-    if (std::filesystem::exists(lv1_path_s)) return false; // ID 冲突，不要覆盖
-    if (std::filesystem::exists(lv1_path_i)) return false; // ID 冲突，不要覆盖
+    std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
 
-    std::ofstream lv1_write_i (lv1_path_i, std::ios::trunc | std::ios::binary);
-    std::ofstream lv1_write_s (lv1_path_s, std::ios::trunc | std::ios::binary);//存在清空不存在创建 | 二进制打开
-    if (!lv1_write_s || !lv1_write_i) return false;
+    Footer footer{};
 
-    // 用 map 收集所有 key 的最新版本 map 天然去重
-    // 从旧到新遍历 level_0（id 小的是旧的，后遍历的覆盖先遍历的）
+    //1. 合并 level_0 的所有 key 到 map
     std::map<std::string, std::pair<uint8_t, std::string>> merged;
 
     for (uint64_t id = 0; id < level_0_next_id; ++id)
     {
+        std::string lv0_path = "../data/level_0/SSTable_" + std::to_string(id) + ".sst";
+        std::ifstream f0(lv0_path, std::ios::binary | std::ios::ate);
+        if (!f0) continue;
 
-        std::string lv0_path_s = "../data/level_0/SSTable_" + std::to_string(id) + ".sst";
+        // 读 Footer
+        std::streamsize fsize = f0.tellg();
+        if (fsize < (std::streamsize)FOOTER_SIZE) continue;
+        f0.seekg(-(std::streamoff)FOOTER_SIZE, std::ios::end);
 
-        std::ifstream lv0_read_s (lv0_path_s, std::ios::binary);
-        if (!lv0_read_s) continue;;
+        Footer ft0;
+        f0.read(reinterpret_cast<char*>(&ft0), sizeof(ft0));
+        if (ft0.magic != FOOTER_MAGIC) continue;
 
-        while (1)
+        // 读 Data Section
+        f0.seekg(ft0.data_offset);
+        uint64_t data_end = ft0.data_offset + ft0.data_size;
+
+        while ((uint64_t)f0.tellg() < data_end)
         {
             uint8_t deleted;
-            if (!lv0_read_s.read(reinterpret_cast<char*> (&deleted), sizeof(deleted))) break;
-            
+            if (!f0.read(reinterpret_cast<char*>(&deleted), sizeof(deleted))) break;
+
             uint32_t key_len;
-            if (!lv0_read_s.read(reinterpret_cast<char*> (&key_len), sizeof(key_len))) break;
+            if (!f0.read(reinterpret_cast<char*>(&key_len), sizeof(key_len))) break;
             std::string key;
             key.resize(key_len);
-            if (!lv0_read_s.read(reinterpret_cast<char*> (key.data()), key_len)) break;
-            
+            if (!f0.read(key.data(), key_len)) break;
+
             uint32_t value_len;
-            if (!lv0_read_s.read(reinterpret_cast<char*> (&value_len), sizeof(value_len))) break;
+            if (!f0.read(reinterpret_cast<char*>(&value_len), sizeof(value_len))) break;
             std::string value;
             value.resize(value_len);
-            if (!lv0_read_s.read(reinterpret_cast<char*> (value.data()), value_len)) break;
+            if (!f0.read(value.data(), value_len)) break;
 
-            merged[key] = {deleted, value};
+            merged[key] = {deleted, value};   // 后覆盖先
         }
     }
 
-    // 写入level_1新文件
-    for (const auto& kv : merged)
+    //2. 写 Data Section
+    footer.data_offset = f.tellp();
+    BloomFilter bloom(merged.size());
+
+    for (const auto& [key, kv] : merged)
     {
-        const std::string& key = kv.first;
-        uint8_t deleted = kv.second.first;
-        const std::string& value = kv.second.second;
+        uint8_t deleted = kv.first;
+        const std::string& value = kv.second;
 
         uint32_t key_len = static_cast<uint32_t>(key.size());
         uint32_t value_len = static_cast<uint32_t>(value.size());
-        uint64_t offset = lv1_write_s.tellp();
 
-        level1_index_[level_1_next_id][key] = offset;
+        uint64_t offset_in_data = static_cast<uint64_t>(f.tellp()) - footer.data_offset;
 
-        lv1_write_s.write(reinterpret_cast<const char*>(&deleted), sizeof(deleted));
-        lv1_write_s.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
-        lv1_write_s.write(key.data(), key_len);
-        lv1_write_s.write(reinterpret_cast<const char*>(&value_len), sizeof(value_len));
-        lv1_write_s.write(value.data(), value_len);
+        level1_index_[level_1_next_id][key] = offset_in_data;
+        bloom.Add(key);
 
-        lv1_write_i.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
-        lv1_write_i.write(key.data(), key_len);
-        lv1_write_i.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
+        f.write(reinterpret_cast<const char*>(&deleted), sizeof(deleted));
+        f.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
+        f.write(key.data(), key_len);
+        f.write(reinterpret_cast<const char*>(&value_len), sizeof(value_len));
+        f.write(value.data(), value_len);
     }
 
-    lv1_write_s.close();
-    lv1_write_i.close();
+    footer.data_size = static_cast<uint64_t>(f.tellp()) - footer.data_offset;
+
+    // 3. 写 Index Section
+    footer.index_offset = f.tellp();
+
+    for (const auto& [key, offset] : level1_index_[level_1_next_id])
+    {
+        uint32_t key_len = static_cast<uint32_t>(key.size());
+        f.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
+        f.write(key.data(), key_len);
+        f.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
+    }
+
+    footer.index_size = static_cast<uint64_t>(f.tellp()) - footer.index_offset;
+
+    //4. 写 Bloom Section
+    footer.bloom_offset = f.tellp();
+
+    level1_bloom_[level_1_next_id] = std::move(bloom);
+    std::string bloom_data = level1_bloom_[level_1_next_id].Serialize();
+    f.write(bloom_data.data(), bloom_data.size());
+
+    footer.bloom_size = static_cast<uint64_t>(f.tellp()) - footer.bloom_offset;
+
+    //5. 写 Footer
+    footer.magic = FOOTER_MAGIC;
+    f.write(reinterpret_cast<const char*>(&footer), sizeof(footer));
+
+    f.close();
+
+    //6. rename
+    std::filesystem::rename(tmp_path, path);
 
     ++level_1_next_id;
     return true;
@@ -280,4 +396,30 @@ void SSTable::RemoveIndex(uint64_t id, int level)
     {
         level1_index_.erase(id);
     }
+}
+
+
+bool SSTable::ReadEntry(std::ifstream& f, std::string& value)
+{
+    uint8_t deleted;
+    if (!f.read(reinterpret_cast<char*>(&deleted), sizeof(deleted))) return false;
+
+    uint32_t key_len;
+    if (!f.read(reinterpret_cast<char*>(&key_len), sizeof(key_len))) return false;
+
+    std::string key_tmp;
+    key_tmp.resize(key_len);
+    if (!f.read(key_tmp.data(), key_len)) return false;
+
+    uint32_t value_len;
+    if (!f.read(reinterpret_cast<char*>(&value_len), sizeof(value_len))) return false;
+
+    std::string value_tmp;
+    value_tmp.resize(value_len);
+    if (!f.read(value_tmp.data(), value_len)) return false;
+
+    if (deleted) return false;   // tombstone
+
+    value = std::move(value_tmp);
+    return true;
 }

@@ -3,6 +3,8 @@
 #include "MemTable.h"
 #include "WAL.h"
 #include "SSTable.h"
+#include <optional> //要么存一个有效值，要么什么都没有
+
 
 
 class KVStore
@@ -26,5 +28,7 @@ private:
     uint64_t level_0_next_id_;
     uint64_t level_1_next_id_;
 
-    void LoadIndex(uint64_t max_id, std::string& level_dir, int level);
+    std::optional<uint64_t> LoadAllSSTables(const std::string& dir, int level);
+    void CleanupTmpFiles(const std::string& dir);
+    std::optional<uint64_t> ParseSSTableId(const std::string& filename);
 };

@@ -1,4 +1,7 @@
 #include "WAL.h"
+#include <chrono>
+
+
 
 //4字节type + 4字节len + 4字节len + 内容
 
@@ -19,10 +22,25 @@ WAL::WAL(const std::string& path) : path_(path)
     // O_WRONLY: 只写
     fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd_ < 0) std::cerr << "WAL open failed: " << strerror(errno) << std::endl;
+
+    // 启动后台 fsync 线程
+    sync_thread_ = std::thread([this] { syncLoop(); });
 }
 
 WAL::~WAL()
 {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        stop_ = true;
+    }
+
+    cv_.notify_all();
+
+    if (sync_thread_.joinable())
+    {
+        sync_thread_.join();
+    }
+
     if (fd_ >= 0)
     {
         ::fsync(fd_);
@@ -54,11 +72,12 @@ bool WAL::Append(Type& type, std::string& key, std::string& value)
         return false;
     }
 
-    // 关键：fsync 保证数据落盘
-    if (::fsync(fd_) != 0) {
-        std::cerr << "WAL fsync failed: " << strerror(errno) << std::endl;
-        return false;
+    // 标记需要 fsync，唤醒后台线程
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        need_sync_ = true;
     }
+    cv_.notify_one();
 
     return true;
 
@@ -115,4 +134,26 @@ bool WAL::Clear()
     if (ftruncate(fd_, 0) != 0) return false;
     // 因为 O_APPEND，下次写会自动回到末尾
     return true;
+}
+
+void WAL::syncLoop()
+{
+    while (true)
+    {
+        std::unique_lock<std::mutex> lock(mu_);
+
+        // 等待：need_sync_ 为 true 或 stop_ //wait_for 每隔10自动唤醒
+        cv_.wait_for(lock, std::chrono::milliseconds(10), [this] { return need_sync_ || stop_; });
+
+        if (stop_) break;
+
+        if (need_sync_) 
+        {
+            need_sync_ = false;
+            lock.unlock();         // 解锁再 fsync 因为很慢不应该站锁很慢
+            ::fsync (fd_);
+        }
+
+    }
+
 }
